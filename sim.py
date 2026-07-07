@@ -118,7 +118,10 @@ def init_disk_particles():
         arm = ti.cast(i % 3, ti.f32)
         radius = INNER_RADIUS + (OUTER_RADIUS - INNER_RADIUS) * ti.sqrt(v)
         angle = 2.0 * math.pi * u + arm * 2.094 + 0.72 * radius
-        height = (w - 0.5) * 2.0 * DISK_HALF_THICKNESS
+        # Five distinct stratified layers with randomized micro-thickness
+        layer = ti.cast(i % 5, ti.f32) - 2.0
+        layer_offset = layer * 0.045
+        height = layer_offset + (w - 0.5) * 0.02
         p = ti.Vector([ti.cos(angle) * radius, height, ti.sin(angle) * radius])
 
         tangent = ti.Vector([-ti.sin(angle), 0.0, ti.cos(angle)])
@@ -178,7 +181,19 @@ def update_particles(dt: ti.f32, time_s: ti.f32):
 
         # Breathing spiral density wave: small enough to stay graceful.
         acceleration += radial * (SPIRAL_WAVE_STRENGTH * arm_wave * (0.35 + 0.65 * pulse))
-        acceleration += ti.Vector([0.0, -2.2 * p.y, 0.0])
+        
+        layer = ti.cast(i % 5, ti.f32) - 2.0
+        layer_offset = layer * 0.045
+        # Restoring force to the designated layer height instead of y = 0
+        acceleration += ti.Vector([0.0, -2.2 * (p.y - layer_offset), 0.0])
+        
+        # Gentle turbulence so the disk appears alive
+        seed = particle_seed[i] * 6.28
+        turb_y = ti.sin(time_s * 2.4 + p.x * 3.0 + seed) * 0.045
+        turb_radial = ti.cos(time_s * 1.92 + p.z * 3.0 + seed) * 0.035
+        acceleration += ti.Vector([0.0, turb_y, 0.0])
+        acceleration += radial * turb_radial
+
         acceleration -= radial * INWARD_DRIFT * (0.55 + 0.9 / (r + 0.2))
         acceleration += tangent * 0.012 * ti.sin(time_s * 1.7 + particle_seed[i] * 6.28)
 
@@ -187,13 +202,13 @@ def update_particles(dt: ti.f32, time_s: ti.f32):
         p += v * dt
 
         rr = safe_len(p)
-        if rr < EVENT_HORIZON_RADIUS * 1.03 or rr > OUTER_RADIUS * 1.45 or ti.abs(p.y) > 0.65:
+        if rr < EVENT_HORIZON_RADIUS * 1.03 or rr > OUTER_RADIUS * 1.45 or ti.abs(p.y - layer_offset) > 0.65:
             idx = ti.cast(i, ti.f32)
             u = hash11(idx * 17.17 + time_s * 0.13)
             h = hash11(idx * 23.11 + time_s * 0.17)
             radius = OUTER_RADIUS * (0.78 + 0.20 * hash11(idx * 31.3 + time_s * 0.07))
             angle2 = 2.0 * math.pi * u + 0.62 * radius
-            p = ti.Vector([ti.cos(angle2) * radius, (h - 0.5) * DISK_HALF_THICKNESS, ti.sin(angle2) * radius])
+            p = ti.Vector([ti.cos(angle2) * radius, layer_offset + (h - 0.5) * 0.02, ti.sin(angle2) * radius])
             tangent2 = ti.Vector([-ti.sin(angle2), 0.0, ti.cos(angle2)])
             radial2 = ti.Vector([ti.cos(angle2), 0.0, ti.sin(angle2)])
             v = tangent2 * ti.sqrt(GM / (radius + SOFTENING_EPSILON)) - radial2 * INWARD_DRIFT
@@ -350,11 +365,20 @@ def run_window():
             sim_time += frame_dt
             update_particles(TIME_STEP, sim_time)
 
-        reveal = min(1.0, (now - start_time) / 5.0)
-        camera_angle = 0.45 + sim_time * 0.18
-        camera_pitch = 0.72 - 0.22 * reveal
-        camera_distance = 7.2 - 1.25 * reveal
-        zoom = 1.55 + 0.22 * reveal
+        # Smooth camera reveal sequence lasting 10 seconds
+        reveal_duration = 10.0
+        reveal_raw = min(1.0, (now - start_time) / reveal_duration)
+        # Smoothstep easing function
+        reveal_eased = reveal_raw * reveal_raw * (3.0 - 2.0 * reveal_raw)
+
+        # Gentle orbital motion, starting and ending smoothly (increased sweep)
+        camera_angle = 0.25 + reveal_eased * 4.2 + sim_time * 0.05
+        # Pitch starts at an inclined angle and eases down to a cinematic profile
+        camera_pitch = 1.0 - 0.5 * reveal_eased
+        # Starts significantly farther away (16.0) and moves inward (to 5.95) for a dramatic 3x dolly effect
+        camera_distance = 16.0 - 10.05 * reveal_eased
+        # Subtle field-of-view (zoom) animation
+        zoom = 1.25 + 0.52 * reveal_eased
 
         clear_framebuffer()
         draw_background(sim_time)
