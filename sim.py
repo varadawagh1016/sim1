@@ -144,9 +144,17 @@ def init_background():
         star_pos[i] = ti.Vector([x, y])
         cool = hash11(idx * 57.9 + 4.0)
         base = ti.Vector([1.0, 0.86 + 0.14 * cool, 0.70 + 0.30 * cool])
-        if brightness > 0.92:
-            base = ti.Vector([0.58, 0.72, 1.0])
-        star_col[i] = base * (0.12 + 0.68 * brightness * brightness)
+        if brightness > 0.90:
+            # Blue-giant/white star
+            base = ti.Vector([0.55, 0.75, 1.0])
+        elif brightness < 0.25:
+            # Dim reddish/orange dwarf star
+            base = ti.Vector([1.0, 0.45 + 0.15 * cool, 0.32])
+        elif brightness > 0.75:
+            # Warm yellow star
+            base = ti.Vector([1.0, 0.95, 0.82])
+        # Higher exponent creates a more realistic star brightness distribution (more dim, fewer extremely bright stars)
+        star_col[i] = base * (0.05 + 0.95 * ti.pow(brightness, 3.0))
 
     for i in range(GALAXY_PARTICLES):
         idx = ti.cast(i, ti.f32)
@@ -223,7 +231,24 @@ def update_particles(dt: ti.f32, time_s: ti.f32):
 @ti.kernel
 def clear_framebuffer():
     for x, y in ti.ndrange(WIDTH, HEIGHT):
-        framebuffer[x, y] = ti.Vector([0.0015, 0.0018, 0.0045])
+        nx = ti.cast(x, ti.f32) / ti.cast(WIDTH, ti.f32)
+        ny = ti.cast(y, ti.f32) / ti.cast(HEIGHT, ti.f32)
+        
+        # Nebula 1: Teal/Blue in top-left
+        d1 = ti.sqrt((nx - 0.25) * (nx - 0.25) + (ny - 0.75) * (ny - 0.75) * 1.4)
+        neb1 = ti.exp(-d1 * 2.5) * ti.Vector([0.005, 0.024, 0.035])
+        
+        # Nebula 2: Purple/Magenta in bottom-right
+        d2 = ti.sqrt((nx - 0.78) * (nx - 0.78) * 1.3 + (ny - 0.28) * (ny - 0.28))
+        neb2 = ti.exp(-d2 * 2.8) * ti.Vector([0.026, 0.008, 0.028])
+        
+        # Base cosmic dust layer (organic variations across the screen)
+        dust_field = (ti.sin(nx * 4.5 + ny * 2.1) * ti.cos(ny * 3.8 - nx * 1.5) * 0.5 + 0.5) * 0.0045
+        # Very fine subtle cosmic dust grain
+        grain = (ti.sin(nx * 450.0 + ny * 120.0) * ti.cos(ny * 380.0 - nx * 90.0)) * 0.0012
+        dust = ti.Vector([1.1, 0.9, 0.7]) * (dust_field + grain)
+        
+        framebuffer[x, y] = ti.Vector([0.0015, 0.0018, 0.0045]) + neb1 + neb2 + dust
 
 
 @ti.kernel
@@ -252,18 +277,20 @@ def draw_event_horizon(camera_angle: ti.f32, camera_pitch: ti.f32, camera_distan
     cy = ti.cast(center.y * HEIGHT, ti.i32)
     radius_px = ti.cast(EVENT_HORIZON_RADIUS * zoom / (camera_distance + SOFTENING_EPSILON) * HEIGHT, ti.i32)
     radius_px = ti.max(18, radius_px)
-    glow_radius = radius_px * 4
+    glow_radius = radius_px * 5
     pulse = 0.86 + 0.14 * ti.sin(time_s * 1.18)
 
-    for dx, dy in ti.ndrange((-150, 151), (-150, 151)):
+    for dx, dy in ti.ndrange((-220, 221), (-220, 221)):
         px = cx + dx
         py = cy + dy
         if 0 <= px < WIDTH and 0 <= py < HEIGHT:
             d = ti.sqrt(ti.cast(dx * dx + dy * dy, ti.f32) + SOFTENING_EPSILON)
             if d < ti.cast(glow_radius, ti.f32):
-                ring = ti.exp(-ti.abs(d - ti.cast(radius_px, ti.f32) * 1.55) * 0.055)
-                halo = ti.exp(-d * 0.018)
-                glow = ti.Vector([1.0, 0.54, 0.16]) * (0.11 * ring + 0.035 * halo) * pulse
+                # Brighter, more defined photon ring slightly outside horizon
+                ring = ti.exp(-ti.abs(d - ti.cast(radius_px, ti.f32) * 1.25) * 0.07)
+                # Soft cinematic halo that starts at horizon edge and decays smoothly outwards
+                halo = ti.exp(-ti.max(0.0, d - ti.cast(radius_px, ti.f32)) * 0.012)
+                glow = ti.Vector([1.0, 0.55, 0.18]) * (0.34 * ring + 0.09 * halo) * pulse
                 framebuffer[px, py] = ti.min(framebuffer[px, py] + glow, ti.Vector([1.0, 1.0, 1.0]))
             if d < ti.cast(radius_px, ti.f32):
                 framebuffer[px, py] = ti.Vector([0.0, 0.0, 0.0])
