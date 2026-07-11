@@ -39,6 +39,7 @@ star_pos = None
 star_col = None
 galaxy_pos = None
 galaxy_col = None
+nebula_col = None
 framebuffer = None
 
 
@@ -58,15 +59,44 @@ def safe_len(v):
 
 
 @ti.func
+def hash21(p):
+    s = ti.sin(p.x * 127.1 + p.y * 311.7) * 43758.5453
+    return s - ti.floor(s)
+
+
+@ti.func
+def value_noise(p):
+    cell = ti.floor(p)
+    f = p - cell
+    u = f * f * (3.0 - 2.0 * f)
+    a = hash21(cell)
+    b = hash21(cell + ti.Vector([1.0, 0.0]))
+    c = hash21(cell + ti.Vector([0.0, 1.0]))
+    d = hash21(cell + ti.Vector([1.0, 1.0]))
+    x1 = a * (1.0 - u.x) + b * u.x
+    x2 = c * (1.0 - u.x) + d * u.x
+    return x1 * (1.0 - u.y) + x2 * u.y
+
+
+@ti.func
+def nebula_fbm(p):
+    n = value_noise(p * 1.35) * 0.52
+    n += value_noise(p * 2.85 + ti.Vector([8.4, 2.1])) * 0.30
+    n += value_noise(p * 6.10 + ti.Vector([1.7, 9.2])) * 0.13
+    n += value_noise(p * 12.0 + ti.Vector([5.3, 4.8])) * 0.05
+    return n
+
+
+@ti.func
 def disk_palette(radius, pulse, blue_shift):
     # Physically inspired thermal gradient:
     # white-blue hot inner gas -> golden/orange disk -> dim red outer edge.
     t = (radius - INNER_RADIUS) / (OUTER_RADIUS - INNER_RADIUS + SOFTENING_EPSILON)
     t = ti.max(0.0, ti.min(1.0, t))
-    inner = ti.Vector([0.78, 0.92, 1.0])
-    gold = ti.Vector([1.0, 0.68, 0.20])
-    orange = ti.Vector([1.0, 0.30, 0.08])
-    red = ti.Vector([0.42, 0.045, 0.025])
+    inner = ti.Vector([0.94, 0.98, 1.0])
+    gold = ti.Vector([1.0, 0.72, 0.24])
+    orange = ti.Vector([1.0, 0.34, 0.10])
+    red = ti.Vector([0.34, 0.035, 0.024])
 
     color = inner
     if t < 0.33:
@@ -79,10 +109,11 @@ def disk_palette(radius, pulse, blue_shift):
         u = (t - 0.72) / 0.28
         color = orange * (1.0 - u) + red * u
 
-    heat = 1.15 - 0.72 * t
-    color *= heat * (0.78 + 0.32 * pulse)
-    color += ti.Vector([0.03, 0.06, 0.13]) * ti.max(0.0, blue_shift)
-    return ti.min(color, ti.Vector([1.0, 1.0, 1.0]))
+    hot_core = ti.exp(-t * 4.2)
+    heat = 0.72 + 1.42 * hot_core + 0.22 * (1.0 - t)
+    color *= heat * (0.74 + 0.34 * pulse)
+    color += ti.Vector([0.07, 0.12, 0.22]) * ti.max(0.0, blue_shift)
+    return color
 
 
 @ti.func
@@ -144,17 +175,9 @@ def init_background():
         star_pos[i] = ti.Vector([x, y])
         cool = hash11(idx * 57.9 + 4.0)
         base = ti.Vector([1.0, 0.86 + 0.14 * cool, 0.70 + 0.30 * cool])
-        if brightness > 0.90:
-            # Blue-giant/white star
-            base = ti.Vector([0.55, 0.75, 1.0])
-        elif brightness < 0.25:
-            # Dim reddish/orange dwarf star
-            base = ti.Vector([1.0, 0.45 + 0.15 * cool, 0.32])
-        elif brightness > 0.75:
-            # Warm yellow star
-            base = ti.Vector([1.0, 0.95, 0.82])
-        # Higher exponent creates a more realistic star brightness distribution (more dim, fewer extremely bright stars)
-        star_col[i] = base * (0.05 + 0.95 * ti.pow(brightness, 3.0))
+        if brightness > 0.92:
+            base = ti.Vector([0.58, 0.72, 1.0])
+        star_col[i] = base * (0.12 + 0.68 * brightness * brightness)
 
     for i in range(GALAXY_PARTICLES):
         idx = ti.cast(i, ti.f32)
@@ -229,26 +252,65 @@ def update_particles(dt: ti.f32, time_s: ti.f32):
 
 
 @ti.kernel
+def init_nebula_background():
+    for x, y in ti.ndrange(WIDTH, HEIGHT):
+        uv = ti.Vector([
+            ti.cast(x, ti.f32) / ti.cast(WIDTH, ti.f32),
+            ti.cast(y, ti.f32) / ti.cast(HEIGHT, ti.f32),
+        ])
+        centered = ti.Vector([(uv.x - 0.5) * ASPECT, uv.y - 0.5])
+        p = ti.Vector([centered.x * 1.86 + 1.4, centered.y * 1.86 - 0.2])
+
+        broad = nebula_fbm(p)
+        wisps = nebula_fbm(ti.Vector([p.x * 1.25 + broad * 1.9, p.y * 0.72 - broad * 1.2]) + ti.Vector([3.1, 6.4]))
+        filaments = nebula_fbm(ti.Vector([p.x * 3.6 + wisps * 2.4, p.y * 1.55 - broad * 1.7]) + ti.Vector([7.7, 1.3]))
+
+        sweep = 0.5 + 0.5 * ti.sin(centered.x * 3.7 - centered.y * 5.2 + broad * 4.4)
+        diagonal = ti.exp(-ti.abs(centered.y + centered.x * 0.28 + 0.02) * 1.62)
+        upper_cloud = ti.exp(-((uv.x - 0.70) * (uv.x - 0.70) * 3.1 + (uv.y - 0.73) * (uv.y - 0.73) * 4.3))
+        lower_cloud = ti.exp(-((uv.x - 0.28) * (uv.x - 0.28) * 3.3 + (uv.y - 0.24) * (uv.y - 0.24) * 4.6))
+        left_curtain = ti.exp(-((uv.x - 0.08) * (uv.x - 0.08) * 7.0 + (uv.y - 0.58) * (uv.y - 0.58) * 1.8))
+        right_curtain = ti.exp(-((uv.x - 0.92) * (uv.x - 0.92) * 7.2 + (uv.y - 0.44) * (uv.y - 0.44) * 2.0))
+
+        density = (broad * 0.42 + wisps * 0.36 + filaments * 0.22)
+        density = ti.max(0.0, density - 0.22) / 0.78
+        density = density * density * (3.0 - 2.0 * density)
+        gap_a = ti.exp(-((uv.x - 0.43) * (uv.x - 0.43) * 18.0 + (uv.y - 0.72) * (uv.y - 0.72) * 22.0))
+        gap_b = ti.exp(-((uv.x - 0.61) * (uv.x - 0.61) * 15.0 + (uv.y - 0.22) * (uv.y - 0.22) * 24.0))
+        coverage = ti.min(1.0, diagonal * 0.66 + upper_cloud * 0.46 + lower_cloud * 0.42 + left_curtain * 0.30 + right_curtain * 0.28 + sweep * 0.16)
+        coverage *= 1.0 - ti.min(0.58, gap_a * 0.48 + gap_b * 0.42)
+        opacity = density * coverage
+
+        center_clear = 1.0 - ti.exp(-((uv.x - 0.5) * (uv.x - 0.5) + (uv.y - 0.51) * (uv.y - 0.51)) * 10.5)
+        ring_frame = 0.62 + 0.38 * ti.min(1.0, ti.sqrt(centered.x * centered.x + centered.y * centered.y) * 1.7)
+        edge_depth = 0.66 + 0.34 * ti.sqrt(centered.x * centered.x + centered.y * centered.y)
+        opacity *= center_clear * edge_depth
+        opacity = ti.min(opacity, 0.88)
+
+        indigo = ti.Vector([0.014, 0.020, 0.075])
+        violet = ti.Vector([0.090, 0.034, 0.155])
+        magenta = ti.Vector([0.160, 0.034, 0.120])
+        cyan_teal = ti.Vector([0.018, 0.145, 0.152])
+        gold = ti.Vector([0.170, 0.095, 0.030])
+
+        cool_mix = broad
+        warm_mix = ti.max(0.0, filaments - 0.58) * 2.38
+        color = indigo * (1.0 - cool_mix) + violet * cool_mix
+        color = color * (1.0 - wisps * 0.64) + cyan_teal * (wisps * 0.64)
+        color += magenta * (sweep * opacity * 0.62)
+        color += gold * (warm_mix * opacity * 0.34)
+        color *= ring_frame
+
+        contrast_vignette = 1.0 - ti.min(0.58, ti.exp(-((uv.x - 0.5) * (uv.x - 0.5) + (uv.y - 0.51) * (uv.y - 0.51)) * 6.0) * 0.48)
+        large_variation = 0.72 + 0.28 * (0.5 + 0.5 * ti.sin(uv.x * 2.8 + uv.y * 1.7 + broad * 2.2))
+        base = ti.Vector([0.00045, 0.00065, 0.00235]) * contrast_vignette
+        nebula_col[x, y] = base + color * opacity * large_variation * 0.82
+
+
+@ti.kernel
 def clear_framebuffer():
     for x, y in ti.ndrange(WIDTH, HEIGHT):
-        nx = ti.cast(x, ti.f32) / ti.cast(WIDTH, ti.f32)
-        ny = ti.cast(y, ti.f32) / ti.cast(HEIGHT, ti.f32)
-        
-        # Nebula 1: Teal/Blue in top-left
-        d1 = ti.sqrt((nx - 0.25) * (nx - 0.25) + (ny - 0.75) * (ny - 0.75) * 1.4)
-        neb1 = ti.exp(-d1 * 2.5) * ti.Vector([0.005, 0.024, 0.035])
-        
-        # Nebula 2: Purple/Magenta in bottom-right
-        d2 = ti.sqrt((nx - 0.78) * (nx - 0.78) * 1.3 + (ny - 0.28) * (ny - 0.28))
-        neb2 = ti.exp(-d2 * 2.8) * ti.Vector([0.026, 0.008, 0.028])
-        
-        # Base cosmic dust layer (organic variations across the screen)
-        dust_field = (ti.sin(nx * 4.5 + ny * 2.1) * ti.cos(ny * 3.8 - nx * 1.5) * 0.5 + 0.5) * 0.0045
-        # Very fine subtle cosmic dust grain
-        grain = (ti.sin(nx * 450.0 + ny * 120.0) * ti.cos(ny * 380.0 - nx * 90.0)) * 0.0012
-        dust = ti.Vector([1.1, 0.9, 0.7]) * (dust_field + grain)
-        
-        framebuffer[x, y] = ti.Vector([0.0015, 0.0018, 0.0045]) + neb1 + neb2 + dust
+        framebuffer[x, y] = nebula_col[x, y]
 
 
 @ti.kernel
@@ -280,17 +342,24 @@ def draw_event_horizon(camera_angle: ti.f32, camera_pitch: ti.f32, camera_distan
     glow_radius = radius_px * 5
     pulse = 0.86 + 0.14 * ti.sin(time_s * 1.18)
 
-    for dx, dy in ti.ndrange((-220, 221), (-220, 221)):
+    for dx, dy in ti.ndrange((-190, 191), (-190, 191)):
         px = cx + dx
         py = cy + dy
         if 0 <= px < WIDTH and 0 <= py < HEIGHT:
             d = ti.sqrt(ti.cast(dx * dx + dy * dy, ti.f32) + SOFTENING_EPSILON)
             if d < ti.cast(glow_radius, ti.f32):
-                # Brighter, more defined photon ring slightly outside horizon
-                ring = ti.exp(-ti.abs(d - ti.cast(radius_px, ti.f32) * 1.25) * 0.07)
-                # Soft cinematic halo that starts at horizon edge and decays smoothly outwards
-                halo = ti.exp(-ti.max(0.0, d - ti.cast(radius_px, ti.f32)) * 0.012)
-                glow = ti.Vector([1.0, 0.55, 0.18]) * (0.34 * ring + 0.09 * halo) * pulse
+                rp = ti.cast(radius_px, ti.f32)
+                photon_center = rp * 1.44
+                core = ti.exp(-ti.abs(d - photon_center) * 0.18)
+                hot_line = ti.exp(-ti.abs(d - photon_center) * 0.55)
+                warm_falloff = ti.exp(-ti.abs(d - photon_center * 1.08) * 0.075)
+                halo = ti.exp(-d * 0.016)
+                angular = ti.atan2(ti.cast(dy, ti.f32), ti.cast(dx, ti.f32))
+                uneven = 0.88 + 0.12 * ti.sin(angular * 5.0 + time_s * 0.7)
+                glow = ti.Vector([1.0, 0.93, 0.78]) * (0.24 * hot_line * uneven)
+                glow += ti.Vector([1.0, 0.58, 0.16]) * (0.14 * core + 0.055 * warm_falloff)
+                glow += ti.Vector([0.42, 0.54, 0.78]) * (0.022 * halo)
+                glow *= pulse
                 framebuffer[px, py] = ti.min(framebuffer[px, py] + glow, ti.Vector([1.0, 1.0, 1.0]))
             if d < ti.cast(radius_px, ti.f32):
                 framebuffer[px, py] = ti.Vector([0.0, 0.0, 0.0])
@@ -305,20 +374,55 @@ def draw_disk(camera_angle: ti.f32, camera_pitch: ti.f32, camera_distance: ti.f3
         sy = ti.cast(screen.y * HEIGHT, ti.i32)
         if 2 <= sx < WIDTH - 2 and 2 <= sy < HEIGHT - 2 and depth > 0.2:
             r_world = safe_len(particle_pos[i])
-            near_inner = ti.exp(-ti.abs(r_world - INNER_RADIUS) * 2.0)
-            brightness = 0.34 + 0.88 * near_inner
+            angle = ti.atan2(particle_pos[i].z, particle_pos[i].x)
+            near_inner = ti.exp(-ti.abs(r_world - INNER_RADIUS) * 2.8)
+            cool_lane = 0.5 + 0.5 * ti.sin(angle * 5.0 - r_world * 3.4 + time_s * 0.72 + particle_seed[i] * 2.1)
+            hot_knot = 0.5 + 0.5 * ti.sin(angle * 9.0 + r_world * 5.2 - time_s * 1.35 + particle_seed[i] * 6.28)
+            fine_grain = 0.72 + 0.28 * hash11(particle_seed[i] * 91.7 + ti.floor(time_s * 8.0) * 0.17)
+            asymmetry = 0.82 + 0.18 * ti.cos(angle - camera_angle + 0.55)
+            density_shadow = 0.74 + 0.26 * cool_lane
+            brightness = (0.26 + 1.34 * near_inner + 0.34 * hot_knot * near_inner) * density_shadow * fine_grain * asymmetry
+            color_shift = ti.Vector([1.0 + 0.18 * hot_knot * near_inner, 0.95 + 0.11 * near_inner, 0.86 + 0.18 * cool_lane])
             for dx, dy in ti.ndrange((-1, 2), (-1, 2)):
                 px = sx + dx
                 py = sy + dy
                 d2 = ti.cast(dx * dx + dy * dy, ti.f32)
                 splat = ti.exp(-d2 * 0.42) * brightness
                 current = framebuffer[px, py]
-                framebuffer[px, py] = ti.min(current + particle_col[i] * splat, ti.Vector([1.0, 1.0, 1.0]))
+                framebuffer[px, py] = ti.min(current + particle_col[i] * color_shift * splat, ti.Vector([1.35, 1.25, 1.12]))
+
+
+@ti.kernel
+def apply_cinematic_grade():
+    for x, y in ti.ndrange(WIDTH, HEIGHT):
+        uv = ti.Vector([
+            ti.cast(x, ti.f32) / ti.cast(WIDTH, ti.f32),
+            ti.cast(y, ti.f32) / ti.cast(HEIGHT, ti.f32),
+        ])
+        centered = ti.Vector([(uv.x - 0.5) * ASPECT, uv.y - 0.51])
+        color = framebuffer[x, y]
+
+        color = ti.Vector([
+            1.0 - ti.exp(-color.x * 1.06),
+            1.0 - ti.exp(-color.y * 1.02),
+            1.0 - ti.exp(-color.z * 0.98),
+        ])
+        luma = color.dot(ti.Vector([0.2126, 0.7152, 0.0722]))
+        cool_shadow = ti.Vector([0.88, 0.94, 1.08])
+        warm_highlight = ti.Vector([1.08, 1.02, 0.92])
+        grade = cool_shadow * (1.0 - luma) + warm_highlight * luma
+        color *= grade
+
+        vignette = 1.0 - ti.min(0.36, centered.dot(centered) * 0.42)
+        center_focus = 1.0 - ti.min(0.18, ti.exp(-centered.dot(centered) * 8.0) * 0.12)
+        color *= vignette * center_focus
+        color = ti.min(ti.max(color, ti.Vector([0.0, 0.0, 0.0])), ti.Vector([1.0, 1.0, 1.0]))
+        framebuffer[x, y] = ti.sqrt(color)
 
 
 def create_fields():
     global particle_pos, particle_vel, particle_col, particle_seed
-    global star_pos, star_col, galaxy_pos, galaxy_col, framebuffer
+    global star_pos, star_col, galaxy_pos, galaxy_col, nebula_col, framebuffer
 
     log("initialization step 1/6: allocating Taichi fields")
     particle_pos = ti.Vector.field(3, ti.f32, shape=PARTICLE_COUNT)
@@ -329,6 +433,7 @@ def create_fields():
     star_col = ti.Vector.field(3, ti.f32, shape=STAR_COUNT)
     galaxy_pos = ti.Vector.field(2, ti.f32, shape=GALAXY_PARTICLES)
     galaxy_col = ti.Vector.field(3, ti.f32, shape=GALAXY_PARTICLES)
+    nebula_col = ti.Vector.field(3, ti.f32, shape=(WIDTH, HEIGHT))
     framebuffer = ti.Vector.field(3, ti.f32, shape=(WIDTH, HEIGHT))
     log("initialization step 1/6 complete: fields allocated")
 
@@ -347,6 +452,8 @@ def create_fields():
     log("verified step 5: starfield and galaxies initialized")
 
     log("initialization step 5/6: framebuffer renderer remains active")
+    init_nebula_background()
+    ti.sync()
     clear_framebuffer()
     ti.sync()
     log("verified renderer: framebuffer clears successfully")
@@ -411,6 +518,7 @@ def run_window():
         draw_background(sim_time)
         draw_disk(camera_angle, camera_pitch, camera_distance, zoom, sim_time)
         draw_event_horizon(camera_angle, camera_pitch, camera_distance, zoom, sim_time)
+        apply_cinematic_grade()
         canvas.set_image(framebuffer)
         window.show()
 
